@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.py_functional import list_of_dict_to_dict_of_list, union_two_dict
 from verl.utils.torch_functional import allgather_dict_tensors
+from verl.utils.transfer_probe import emit_cpu_overhead, emit_event, estimate_nbytes, is_enabled, now_ns, ns_to_ms
 
 __all__ = ["DataProto", "union_tensor_dict"]
 
@@ -923,6 +924,8 @@ class DataProto:
         Returns:
             DataProto: concatenated DataProto
         """
+        probe_enabled = is_enabled()
+        t0 = now_ns() if probe_enabled else 0
         batch_lst = []
         for batch in data:
             batch_lst.append(batch.batch)
@@ -957,7 +960,15 @@ class DataProto:
                 merged_meta_info["metrics"] = list_of_dict_to_dict_of_list(all_metrics)
 
         cls = type(data[0]) if len(data) > 0 else DataProto
-        return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)
+        result = cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)
+        if probe_enabled:
+            emit_cpu_overhead(
+                location="DataProto.concat",
+                elapsed_ms=ns_to_ms(now_ns() - t0),
+                input_parts=len(data),
+                output_bytes=estimate_nbytes(result),
+            )
+        return result
 
     def reorder(self, indices):
         """
@@ -1209,10 +1220,16 @@ class DataProtoFuture:
         return arg_future_lst
 
     def get(self):
+        probe_enabled = is_enabled()
+        t0 = now_ns() if probe_enabled else 0
+
+        ray_get_t0 = now_ns() if probe_enabled else 0
         output = ray.get(self.futures)  # dp_size.
+        ray_get_ms = ns_to_ms(now_ns() - ray_get_t0) if probe_enabled else 0.0
         for o in output:
             assert isinstance(o, DataProto | TensorDict)
 
+        concat_t0 = now_ns() if probe_enabled else 0
         if isinstance(output[0], DataProto):
             output = DataProto.concat(output)  # select dp, concat
         elif isinstance(output[0], TensorDict):
@@ -1221,9 +1238,24 @@ class DataProtoFuture:
             output = concat_tensordict(output)
         else:
             raise TypeError(f"Unknown type {type(o[0])} in DataProtoFuture")
+        concat_ms = ns_to_ms(now_ns() - concat_t0) if probe_enabled else 0.0
 
+        dispatch_ms = 0.0
         if self.dispatch_fn is not None:
+            dispatch_t0 = now_ns() if probe_enabled else 0
             output = self.dispatch_fn(output)  # split in batch dim, select using dp
+            dispatch_ms = ns_to_ms(now_ns() - dispatch_t0) if probe_enabled else 0.0
+
+        if probe_enabled:
+            emit_event(
+                "future_collect",
+                future_count=len(self.futures),
+                ray_get_ms=ray_get_ms,
+                concat_ms=concat_ms,
+                dispatch_ms=dispatch_ms,
+                total_ms=ns_to_ms(now_ns() - t0),
+                output_bytes=estimate_nbytes(output),
+            )
         return output
 
 

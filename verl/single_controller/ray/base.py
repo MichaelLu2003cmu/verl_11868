@@ -30,6 +30,7 @@ from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker,
 from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
 from verl.utils.device import get_device_name
 from verl.utils.py_functional import temp_env_var
+from verl.utils.transfer_probe import emit_event, estimate_nbytes, is_enabled, now_ns, ns_to_ms
 
 __all__ = ["Worker"]
 
@@ -48,18 +49,46 @@ def get_random_string(length: int) -> str:
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
     class Functor:
         def __call__(this, *args, **kwargs):
+            probe_enabled = is_enabled()
+            t0 = now_ns() if probe_enabled else 0
+
+            dispatch_t0 = now_ns() if probe_enabled else 0
             args, kwargs = dispatch_fn(self, *args, **kwargs)
+            dispatch_ms = ns_to_ms(now_ns() - dispatch_t0) if probe_enabled else 0.0
             padding_count = kwargs.pop(_padding_size_key, 0)
+            send_bytes = estimate_nbytes((args, kwargs)) if probe_enabled else 0
+
+            wait_ms = 0.0
             output = execute_fn(method_name, *args, **kwargs)
             if blocking:
+                wait_t0 = now_ns() if probe_enabled else 0
                 output = ray.get(output)
+                wait_ms = ns_to_ms(now_ns() - wait_t0) if probe_enabled else 0.0
+            recv_bytes = estimate_nbytes(output) if probe_enabled else 0
+
+            collect_t0 = now_ns() if probe_enabled else 0
             output = collect_fn(self, output)
+            collect_ms = ns_to_ms(now_ns() - collect_t0) if probe_enabled else 0.0
             if padding_count > 0:
                 if isinstance(output, DataProto):
                     indices = [i for i in range(len(output))][:-padding_count]
                     output = output.select_idxs(indices)
                 elif isinstance(output, list):
                     output = output[:-padding_count]
+
+            if probe_enabled:
+                emit_event(
+                    "transfer_latency",
+                    method_name=method_name,
+                    blocking=bool(blocking),
+                    world_size=getattr(self, "world_size", None),
+                    dispatch_ms=dispatch_ms,
+                    wait_ms=wait_ms,
+                    collect_ms=collect_ms,
+                    total_ms=ns_to_ms(now_ns() - t0),
+                    send_bytes=send_bytes,
+                    recv_bytes=recv_bytes,
+                )
             return output
 
     # use class type to pass the method_name to get a better observability
