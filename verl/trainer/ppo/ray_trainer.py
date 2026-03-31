@@ -320,6 +320,23 @@ class RayPPOTrainer:
 
         self.checkpoint_manager = None
 
+    @staticmethod
+    def _validate_dataloader_state_dict(dataloader_state_dict: dict[str, Any], num_workers: int) -> tuple[bool, str]:
+        """Validate whether saved StatefulDataLoader state matches current loader mode."""
+        if not isinstance(dataloader_state_dict, dict):
+            return False, f"expected dict, got {type(dataloader_state_dict).__name__}"
+
+        # torchdata uses different required keys for single-process vs multiprocess iterators.
+        required_key = "_snapshot" if num_workers > 0 else "_num_yielded"
+        if required_key not in dataloader_state_dict:
+            return (
+                False,
+                f"missing required key '{required_key}' for num_workers={num_workers}. "
+                f"Found keys: {sorted(dataloader_state_dict.keys())[:8]}",
+            )
+
+        return True, ""
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -1023,7 +1040,17 @@ class RayPPOTrainer:
                 )
             else:
                 dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-                self.train_dataloader.load_state_dict(dataloader_state_dict)
+                is_compatible, reason = self._validate_dataloader_state_dict(
+                    dataloader_state_dict=dataloader_state_dict,
+                    num_workers=self.train_dataloader.num_workers,
+                )
+                if is_compatible:
+                    self.train_dataloader.load_state_dict(dataloader_state_dict)
+                else:
+                    print(
+                        "Skipping dataloader state restore due to incompatible state format: "
+                        f"{reason}. Training will continue from current epoch dataloader start."
+                    )
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -1326,6 +1353,15 @@ class RayPPOTrainer:
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        # If resumed from a finished checkpoint, avoid running an extra training step.
+        if self.global_steps >= self.total_training_steps:
+            pprint(
+                f"Checkpoint already reached total_training_steps: "
+                f"{self.global_steps}/{self.total_training_steps}. Exiting training loop."
+            )
+            progress_bar.close()
+            return
 
         # we start from step 1
         self.global_steps += 1
