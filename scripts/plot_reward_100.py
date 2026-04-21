@@ -12,11 +12,13 @@ logs = {
     "Baseline (push)": "checkpoints/verl_examples/gsm8k_2gpu_baseline_100/train_log.txt",
     "+LP+FP16":        "checkpoints/verl_examples/gsm8k_2gpu_fp16_100/train_log.txt",
     "+LP+INT8":        "checkpoints/verl_examples/gsm8k_2gpu_int8_100/train_log.txt",
+    "+LP+BF16":        "checkpoints/verl_examples/gsm8k_2gpu_bf16_100/train_log.txt",
 }
 colors = {
     "Baseline (push)": "#4878CF",
     "+LP+FP16":        "#D65F5F",
     "+LP+INT8":        "#B47CC7",
+    "+LP+BF16":        "#FFA500",
 }
 
 def rolling(vals, w=7):
@@ -51,7 +53,7 @@ if not data:
     print("No data found, exiting.")
     sys.exit(1)
 
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.2))
 fig.suptitle(
     "Training Stability — Controlled Ablation (100 Steps)\n"
     "(2 GPU, Qwen2.5-1.5B-Instruct, batch=32, FSDP offload OFF)",

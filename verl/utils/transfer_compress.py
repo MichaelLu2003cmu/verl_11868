@@ -1,15 +1,19 @@
 # verl/utils/transfer_compress.py
 """Lightweight tensor compression for inter-worker data transfer.
 
-Supports two modes controlled by VERL_TRANSFER_COMPRESS:
+Supports three modes controlled by VERL_TRANSFER_COMPRESS:
+  bf16  – cast all float32 batch tensors to bfloat16 before ray.put();
+          cast back to float32 on the receiver side.  Safest 16-bit option:
+          same exponent range as float32, so no overflow risk.  Recommended.
   fp16  – cast all float32 batch tensors to float16 before ray.put();
-          cast back to float32 on the receiver side.  Low-risk baseline.
+          cast back to float32 on the receiver side.  Same byte savings as
+          bf16 but with narrower exponent range (risk of overflow on large values).
   int8  – per-tensor symmetric quantization with a float32 scale stored
           alongside each tensor.  Higher compression, needs validation.
   (unset / empty) – no compression (default).
 
 Usage:
-    export VERL_TRANSFER_COMPRESS=fp16
+    export VERL_TRANSFER_COMPRESS=bf16
 """
 
 import os
@@ -38,7 +42,11 @@ def compress_batch(
             compressed[key] = tensor
             continue
 
-        if mode == "fp16":
+        if mode == "bf16":
+            compressed[key] = tensor.to(torch.bfloat16)
+            meta[key] = {"orig_dtype": torch.float32, "mode": "bf16"}
+
+        elif mode == "fp16":
             compressed[key] = tensor.to(torch.float16)
             meta[key] = {"orig_dtype": torch.float32, "mode": "fp16"}
 
@@ -69,7 +77,7 @@ def decompress_batch(
             continue
 
         info = meta[key]
-        if info["mode"] == "fp16":
+        if info["mode"] in ("bf16", "fp16"):
             out[key] = tensor.to(info["orig_dtype"])
         elif info["mode"] == "int8":
             out[key] = tensor.float() * info["scale"].to(tensor.device)

@@ -627,10 +627,13 @@ The `summarize_transfer_probe.py` script consumes these events and outputs a
 ### 4.6 How to Enable
 
 ```bash
-# FP16 (recommended):
+# FP16 (fastest measured iter-time in our batch=32 runs):
 VERL_TRANSFER_COMPRESS=fp16
 
-# INT8 (higher compression, CPU quantization overhead):
+# BF16 (same 2× byte cut as FP16; safer exponent range than FP16; may be slower on CPU cast path):
+VERL_TRANSFER_COMPRESS=bf16
+
+# INT8 (higher nominal compression, CPU quantization overhead):
 VERL_TRANSFER_COMPRESS=int8
 
 # With probe to measure savings:
@@ -667,6 +670,7 @@ Use this checklist to verify a correct deployment of all three features together
 | Local-Batch Pull | — | `trainer.use_legacy_worker_impl=enable` |
 | Async Overlap | — | `trainer.use_legacy_worker_impl=enable` |
 | FP16 Compression | `VERL_TRANSFER_COMPRESS=fp16` | `trainer.use_legacy_worker_impl=enable` |
+| BF16 Compression | `VERL_TRANSFER_COMPRESS=bf16` | `trainer.use_legacy_worker_impl=enable` |
 | INT8 Compression | `VERL_TRANSFER_COMPRESS=int8` | `trainer.use_legacy_worker_impl=enable` |
 | V100 compatibility | — | `+actor_rollout_ref.model.override_config.attn_implementation=eager` |
 

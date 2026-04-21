@@ -417,21 +417,26 @@ Variables: dispatch mode + compress.
 
 #### Extended stability run (batch=32, 100 steps)
 
-Three-way comparison at larger batch size to confirm timing trends and training stability.
+Four-way compression comparison at larger batch size (Baseline push vs pull + FP16 / INT8 / BF16).
 
 | Config | avg step\_time (s) | Δ vs Baseline | avg reward (100 steps) |
 |---|---:|---:|---:|
 | Baseline (push) | 21.952 | — | 0.225 |
 | +LP + FP16 | **19.627** | **−10.6%** | 0.079 |
 | +LP + INT8 | 22.550 | +2.7% | 0.075 |
+| +LP + BF16 | 22.682 | +3.3% | 0.034 |
 
 - **FP16 advantage scales with batch size**: −4.4% at batch=8 → **−10.6% at batch=32**.
-  More float32 data per step means more serialization cost saved by fp16 casting.
-- **INT8 overhead persists**: CPU quantization cost slightly exceeds bandwidth savings.
-- **All configs show stable upward reward trends** over 100 steps; mean reward
-  differences reflect run-to-run training variance (random seeds), not compression damage.
-- A sharp FP16 timing drop at step ~35 corresponds to vLLM JIT warmup completing;
-  after warmup, FP16 runs consistently faster.
+  More float32 data per step means more serialization cost saved by half-precision casting.
+- **INT8 and BF16 do not improve wall-clock time here** (+2.7% / +3.3% vs baseline):
+  CPU encode–decode dominates; BF16 matches FP16’s byte savings but uses a slower host path
+  in this environment.
+- **BF16** is still the safest 16-bit choice for extreme log-prob magnitudes (same exponent
+  range as float32); use **FP16** when the goal is maximum iteration throughput.
+- **All configs show learning signal** over 100 steps; mean reward differences reflect
+  run-to-run variance, not a reliable quality ranking between compressors.
+- A sharp FP16 timing drop at step ~35 corresponds to vLLM JIT warmup; after warmup,
+  FP16 stays fastest.
 
 > ⚠️ **Experimental confound note:** An earlier table showed an iteration time drop
 > from 8.22 s (baseline) to 4.22 s (FP16 run).  This 49% drop is **not** attributable

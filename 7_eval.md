@@ -21,6 +21,7 @@ dominant inter-worker data transfer in the actor update stage.  Transfer time
 | +AO (2-GPU, Path B-lite) | 2 | 8 | Off | pull | none |
 | +Comp FP16 (2-GPU) | 2 | 8 | Off | pull | fp16 |
 | +Comp INT8 (2-GPU) | 2 | 8 | Off | pull | int8 |
+| +Comp BF16 (2-GPU, 100-step) | 2 | 32 | Off | pull | bf16 |
 
 > **Note on FSDP offloading:** The Baseline/+LP runs used `param_offload=True,
 > optimizer_offload=True` to fit within 45.5 GB host RAM.  The +AO and +Comp runs
@@ -122,25 +123,29 @@ dispatch mode and compression.
 ### Table 3c — Extended Stability Run (all FSDP OFF, 2-GPU, batch=32, 100 steps)
 
 Larger batch size and more steps to confirm timing trends and training stability.
-No `+LP` alone run at batch=32; the three-way comparison is sufficient.
+No `+LP` alone run at batch=32; four compression variants vs push baseline.
 
 | Config | Dispatch | Compress | avg step\_time (s) | Δ vs Baseline | avg reward (100 steps) |
 |---|---|---|---:|---:|---:|
 | Baseline | push | — | 21.952 | — | 0.225 |
 | +LP + FP16 | pull | fp16 | **19.627** | **−10.6%** | 0.079 |
 | +LP + INT8 | pull | int8 | 22.550 | +2.7% | 0.075 |
+| +LP + BF16 | pull | bf16 | 22.682 | +3.3% | 0.034 |
 
 **Key findings at batch=32:**
 
-- **FP16 advantage grows with batch size**: −10.6% at batch=32 vs −4.4% at batch=8,
-  confirming that compression savings scale with the amount of float32 data transferred.
-- **INT8 overhead persists**: CPU quantization cost slightly exceeds bandwidth savings
-  at this batch size (+2.7% vs baseline).
-- **Reward variance across runs is expected**: all three configs show positive, upward
-  reward trends over 100 steps; the mean differences reflect run-to-run training
-  variance rather than any compression-induced degradation.
-- **FP16 timing drop at step ~35**: visible in panel (b); corresponds to vLLM JIT
-  compilation completing its warmup phase, after which FP16 runs consistently faster.
+- **FP16 is the only mode that improves iteration time** at this scale: −10.6% vs
+  baseline.  BF16 and INT8 both add **~3%** wall-clock overhead vs baseline despite
+  the same 2× byte reduction on float32 tensors as FP16 — extra CPU work for
+  bfloat16/int8 encode–decode and (for INT8) per-tensor scaling dominates the savings.
+- **BF16 vs FP16**: BF16 is numerically safer than FP16 (same exponent range as
+  float32) but **does not** match FP16’s measured speed here; use FP16 when the goal
+  is raw throughput, BF16 when extreme log-prob magnitudes might clip in FP16.
+- **Reward variance across runs is expected**: all configs show learning signal over
+  100 steps; mean reward differences reflect run-to-run variance (seeds / trajectory),
+  not a reliable quality ranking between compressors.
+- **FP16 timing drop at step ~35**: visible in panel (b); vLLM JIT warmup, after which
+  FP16 stays fastest.
 
 ![Reward and iteration time comparison (100 steps, batch=32)](7_reward_curve_controlled.png)
 
@@ -170,6 +175,7 @@ No `+LP` alone run at batch=32; the three-way comparison is sufficient.
 | Local-Batch Pull | −5% Xfer_ms at batch=8; projected −50% at batch≥256 | dispatch+collect ms | `ray.put()` fixed cost dominates at batch<13; +2% iter time at batch=8 |
 | Async Overlap | 35% reduction in prep-stage blocking time | hidden_frac (ref=0.285, values=0.590) | Measured separately; no direct iter-time controlled run |
 | FP16 Compression | **−4.4% at batch=8; −10.6% at batch=32; −58% Xfer_ms** | Tables 3b & 3c (controlled) | Benefit scales with batch; 1.9% payload reduction due to int64-dominant batch |
+| BF16 Compression | +3.3% at batch=32 (vs baseline); same 2× float32 payload cut as FP16 | Table 3c (controlled) | Safer dynamic range than FP16; CPU encode path slower than FP16 in this run |
 | INT8 Compression | −0.8% at batch=8; +2.7% at batch=32; −34% Xfer_ms | Tables 3b & 3c (controlled) | CPU quantization overhead exceeds bandwidth savings at current batch sizes |
 
 > **Attribution note:** The 8.22 s → 4.22 s drop visible in the overall ablation figure
@@ -181,16 +187,16 @@ No `+LP` alone run at batch=32; the three-way comparison is sufficient.
 
 ### Training Stability
 
-Both FP16 and INT8 compression modes cast values back to `float32` before any training
-arithmetic, so model weights and gradients are unaffected.  We validated stability at
-two scales:
+FP16, BF16, and INT8 compression modes cast transferred batch tensors back to
+`float32` before training arithmetic, so model weights and gradients are unaffected.
+We validated stability at two scales:
 
 - **20 steps / batch=8**: all four configs show positive nonzero reward; no systematic
   degradation from compression (Table 3b).
-- **100 steps / batch=32**: all three configs show a clear upward reward trend over the
-  full run (see panel (a) of the reward curve above).  Mean reward differences across
-  configs reflect run-to-run training variance (different random seeds / data order),
-  not compression-induced degradation.  No training collapse was observed in any run.
+- **100 steps / batch=32**: Baseline, +FP16, +INT8, and +BF16 all show learning signal
+  over the full run (see panel (a) of the reward curve above).  Mean reward differences
+  across configs reflect run-to-run variance (seeds / trajectory), not a reliable
+  quality ranking.  No training collapse was observed in any run.
 
 ---
 
