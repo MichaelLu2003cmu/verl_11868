@@ -290,6 +290,60 @@ class RewardLoopWorker:
         return {"reward_score": rm_score}
 
 
+class RewardScoreFuture:
+    """Lazy future returned by :meth:`RewardLoopManager.compute_rm_score_async`.
+
+    Materialization (``ray.get`` on the pending per-worker refs, score-tensor
+    assembly, and the optional reward-model ``sleep`` side effect) is deferred
+    to :meth:`get`. This lets the trainer fire reward scoring alongside other
+    prep-stage kernels and join only right before ``extract_reward`` consumes
+    the ``rm_scores`` field.
+    """
+
+    def __init__(self, manager: "RewardLoopManager", pending_refs: list, data: DataProto):
+        self._manager = manager
+        self._pending_refs = pending_refs
+        self._data = data
+        self._materialized = False
+        self._result: DataProto = None
+
+    def get(self) -> DataProto:
+        if self._materialized:
+            return self._result
+
+        outputs = ray.get(self._pending_refs)
+        outputs_flat = [item for sublist in outputs for item in sublist]
+
+        scores = [item["reward_score"] for item in outputs_flat]
+        if self._manager.config.reward.reward_manager.name == "visual":
+            rm_scores = torch.tensor(scores, dtype=torch.float32).unsqueeze(-1)
+        else:
+            prompt_length = self._data.batch["prompts"].size(1)
+            valid_response_length = self._data.batch["attention_mask"][:, prompt_length:].sum(dim=1)
+            rm_scores = torch.zeros_like(self._data.batch["responses"], dtype=torch.float32)
+            rm_scores[torch.arange(rm_scores.size(0)), valid_response_length - 1] = torch.tensor(
+                scores, dtype=torch.float32
+            )
+        batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(self._data))
+
+        reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
+        reward_extra_keys = list(reward_extra_infos[0].keys())
+        non_tensor_batch = {}
+        for key in reward_extra_keys:
+            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+
+        if self._manager.reward_model_manager is not None:
+            self._manager.reward_model_manager.sleep()
+
+        self._result = DataProto(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info={"reward_extra_keys": reward_extra_keys},
+        )
+        self._materialized = True
+        return self._result
+
+
 class RewardLoopManager:
     """
     RewardLoopManager run in single controller.
@@ -328,44 +382,28 @@ class RewardLoopManager:
             )
 
     def compute_rm_score(self, data: DataProto) -> DataProto:
+        return self.compute_rm_score_async(data).get()
+
+    def compute_rm_score_async(self, data: DataProto) -> "RewardScoreFuture":
+        """Dispatch reward scoring on the reward-loop workers without blocking.
+
+        The ``wake_up`` side effect (if a reward model is configured) and the
+        per-worker ``compute_score_batch.remote`` dispatches happen synchronously
+        so the remote kernels begin running as soon as possible. All ``ray.get``
+        and post-processing (score tensor assembly, ``sleep``) are deferred to
+        :meth:`RewardScoreFuture.get`, allowing the driver to overlap other
+        preparation-stage compute (e.g. ``old_log_prob``) while reward scoring
+        runs on its own resource pool.
+        """
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
         chunks = data.chunk(len(self.reward_loop_workers))
-        outputs = ray.get(
-            [
-                worker.compute_score_batch.remote(chunk)
-                for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
-            ]
-        )
-        outputs_flat = [item for sublist in outputs for item in sublist]
-
-        # compute rm score
-        scores = [item["reward_score"] for item in outputs_flat]
-        if self.config.reward.reward_manager.name == "visual":
-            # visual reward only has one score for the whole response
-            rm_scores = torch.tensor(scores, dtype=torch.float32).unsqueeze(-1)
-        else:
-            prompt_length = data.batch["prompts"].size(1)
-            valid_response_length = data.batch["attention_mask"][:, prompt_length:].sum(dim=1)
-            rm_scores = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
-            rm_scores[torch.arange(rm_scores.size(0)), valid_response_length - 1] = torch.tensor(
-                scores, dtype=torch.float32
-            )
-        batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(data))
-
-        reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
-        non_tensor_batch = {}
-        for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
-
-        if self.reward_model_manager is not None:
-            self.reward_model_manager.sleep()
-
-        return DataProto(
-            batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"reward_extra_keys": reward_extra_keys}
-        )
+        pending_refs = [
+            worker.compute_score_batch.remote(chunk)
+            for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+        ]
+        return RewardScoreFuture(manager=self, pending_refs=pending_refs, data=data)
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():

@@ -1,3 +1,6 @@
+#verl/single_controller/base/decorator.py
+
+
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +36,131 @@ class Dispatch(DynamicEnum):
     _registry = {}
     _next_value = 0
 
+def dispatch_nd_compute_dataproto_pull(dp_rank_mapping: list[int], dp_size, worker_group, *args, **kwargs):
+    import os
+    import ray
+    from verl.protocol import DataProto, DataProtoFuture, DataProtoSliceMeta, DataProtoPullHandle
+    from verl.single_controller.base.worker_group import WorkerGroup
+
+    assert isinstance(worker_group, WorkerGroup)
+
+    def build_handle(obj):
+        assert isinstance(obj, DataProto)
+        pad_size = 0
+        total_len = len(obj)
+        if obj.is_padding_enabled() and total_len % dp_size != 0:
+            pad_size = dp_size - (total_len % dp_size)
+
+        if pad_size > 0:
+            obj = obj[:]
+            obj.padding(padding_size=pad_size)
+
+        # optional sender-side compression (VERL_TRANSFER_COMPRESS=fp16|int8)
+        compress_meta: dict = {}
+        from verl.utils.transfer_compress import get_compress_mode, compress_batch, probe_compress_event
+        if get_compress_mode():
+            import dataclasses
+
+            def _nbytes(d):
+                return sum(t.element_size() * t.numel() for t in d.values() if isinstance(t, __import__("torch").Tensor))
+
+            import torch as _torch
+            from tensordict import TensorDict as _TensorDict
+            orig_batch = dict(obj.batch)
+            compressed_tensors, compress_meta = compress_batch(orig_batch)
+            probe_compress_event(
+                context="pull_build_handle",
+                orig_bytes=_nbytes(orig_batch),
+                comp_bytes=_nbytes(compressed_tensors),
+            )
+            new_batch = _TensorDict(
+                source=compressed_tensors,
+                batch_size=obj.batch.batch_size,
+            )
+            obj = dataclasses.replace(obj, batch=new_batch)
+
+        shard_list = obj.chunk(chunks=dp_size)
+        shard_refs = [ray.put(shard) for shard in shard_list]
+
+        return DataProtoPullHandle(
+            shard_refs=shard_refs,
+            meta=DataProtoSliceMeta(total_len=total_len, dp_size=dp_size, pad_size=pad_size),
+            compress_meta=compress_meta,
+        )
+
+    args = [build_handle(arg) for arg in args]
+    kwargs = {k: build_handle(v) for k, v in kwargs.items()}
+
+    all_args = []
+    for handle in args:
+        transformed = []
+        for i in range(worker_group.world_size):
+            local_dp_rank = dp_rank_mapping[i]
+            transformed.append(handle.materialize(local_dp_rank))
+        all_args.append(transformed)
+
+    all_kwargs = {}
+    for k, handle in kwargs.items():
+        transformed = []
+        for i in range(worker_group.world_size):
+            local_dp_rank = dp_rank_mapping[i]
+            transformed.append(handle.materialize(local_dp_rank))
+        all_kwargs[k] = transformed
+
+    return tuple(all_args), all_kwargs
+
+def dispatch_lazy_compute_data_proto_pull(mesh_name, worker_group, *args, **kwargs):
+    from verl.single_controller.base.worker_group import WorkerGroup
+    assert isinstance(worker_group, WorkerGroup)
+
+    if mesh_name not in worker_group._dispatch_info:
+        worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
+
+    dp_rank_mapping = worker_group._dispatch_info[mesh_name]
+    dp_size = max(dp_rank_mapping) + 1
+    return dispatch_nd_compute_dataproto_pull(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
+
+def make_nd_compute_dataproto_pull_dispatch_fn(mesh_name):
+    return {
+        "dispatch_fn": partial(dispatch_lazy_compute_data_proto_pull, mesh_name),
+        "collect_fn": partial(collect_lazy_compute_data_proto, mesh_name),
+    }
+
+def dispatch_nd_compute_dataproto_selective_future(dp_rank_mapping, dp_size, worker_group, *args, **kwargs):
+    from verl.protocol import DataProtoFuture, build_selective_views_from_future
+
+    def transform(obj):
+        if isinstance(obj, DataProtoFuture):
+            views = build_selective_views_from_future(obj, target_parts=dp_size)
+            return [views[dp_rank_mapping[i]] for i in range(worker_group.world_size)]
+        return None
+
+    all_args = []
+    for arg in args:
+        maybe = transform(arg)
+        if maybe is None:
+            raise TypeError(f"expected DataProtoFuture for selective path, got {type(arg)}")
+        all_args.append(maybe)
+
+    all_kwargs = {}
+    for k, v in kwargs.items():
+        maybe = transform(v)
+        if maybe is None:
+            raise TypeError(f"expected DataProtoFuture for selective path, got {type(v)}")
+        all_kwargs[k] = maybe
+
+    return tuple(all_args), all_kwargs
+
+def dispatch_lazy_compute_data_proto_future_pull(mesh_name, worker_group, *args, **kwargs):
+    from verl.single_controller.base.worker_group import WorkerGroup
+    assert isinstance(worker_group, WorkerGroup)
+
+    if mesh_name not in worker_group._dispatch_info:
+        worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
+
+    dp_rank_mapping = worker_group._dispatch_info[mesh_name]
+    dp_size = max(dp_rank_mapping) + 1
+    return dispatch_nd_compute_dataproto_selective_future(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
 
 def init_predefined_dispatch_mode():
     Dispatch.register("RANK_ZERO")
@@ -379,19 +507,38 @@ def _check_execute_mode(execute_mode):
     assert isinstance(execute_mode, Execute), f"execute_mode must be a Execute. Got {execute_mode}"
 
 
+# def _materialize_futures(*args, **kwargs):
+#     new_args = []
+#     for arg in args:
+#         if isinstance(arg, DataProtoFuture):
+#             arg = arg.get()
+#         # add more type to materialize
+#         new_args.append(arg)
+#     for k, v in kwargs.items():
+#         if isinstance(v, DataProtoFuture):
+#             kwargs[k] = v.get()
+
+#     new_args = tuple(new_args)
+#     return new_args, kwargs
+
 def _materialize_futures(*args, **kwargs):
+    from verl.protocol import DataProtoFuture, DataProtoSelectiveView
+
     new_args = []
     for arg in args:
         if isinstance(arg, DataProtoFuture):
             arg = arg.get()
-        # add more type to materialize
+        elif isinstance(arg, DataProtoSelectiveView):
+            arg = arg.get()
         new_args.append(arg)
+
     for k, v in kwargs.items():
         if isinstance(v, DataProtoFuture):
             kwargs[k] = v.get()
+        elif isinstance(v, DataProtoSelectiveView):
+            kwargs[k] = v.get()
 
-    new_args = tuple(new_args)
-    return new_args, kwargs
+    return tuple(new_args), kwargs
 
 
 def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocking=True, materialize_futures=True):

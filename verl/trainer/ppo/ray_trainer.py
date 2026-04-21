@@ -36,7 +36,7 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import DataProtoFuture, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
@@ -67,6 +67,10 @@ from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
+from verl.utils.transfer_probe import emit_event as _probe_emit_event
+from verl.utils.transfer_probe import is_enabled as _probe_is_enabled
+from verl.utils.transfer_probe import now_ns as _probe_now_ns
+from verl.utils.transfer_probe import ns_to_ms as _probe_ns_to_ms
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -526,6 +530,18 @@ class RayPPOTrainer:
         assert self.reward_loop_manager is not None, "RewardLoopManager is None"
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
+
+    def _compute_reward_colocate_async(self, batch: DataProto):
+        """Non-blocking variant of :meth:`_compute_reward_colocate`.
+
+        Returns a :class:`RewardScoreFuture`. The remote reward-scoring tasks
+        are dispatched immediately so they can run in parallel with other
+        prep-stage compute on the driver (e.g. ``old_log_prob``). Call
+        ``.get()`` on the returned future right before the reward values are
+        needed.
+        """
+        assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+        return self.reward_loop_manager.compute_rm_score_async(batch)
 
     def _should_compute_teacher_colocate(self, batch: DataProto) -> bool:
         return self.use_teacher_policy and not self.distillation_config.teacher_model.enable_resource_pool
@@ -1194,6 +1210,9 @@ class RayPPOTrainer:
                 output = self.actor_rollout_wg.compute_log_prob(batch_td)
             else:
                 output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
+            # compute_ref_log_prob uses blocking=False; materialize before key access.
+            if isinstance(output, DataProtoFuture):
+                output = output.get()
             # gather output
             log_probs = tu.get(output, "log_probs")
             # step 4. No padding to padding
@@ -1473,14 +1492,38 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            batch_reward = self._compute_reward_colocate(batch)
-                            batch = batch.union(batch_reward)
 
-                        # extract reward_tensor and reward_extra_infos_dict for training
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                    # =====================================================================
+                    # Async pipelining (Phase 1): dispatch reward scoring BEFORE
+                    # old_log_prob so the reward-loop workers run in parallel with the
+                    # actor-GPU old_log_prob forward. The reward future captures the
+                    # batch shards at dispatch time via ray.put, so subsequent mutations
+                    # of the local `batch` variable do not affect the remote compute.
+                    # =====================================================================
+                    _probe_step_start_ns = _probe_now_ns() if _probe_is_enabled() else 0
+                    _probe_dispatched_ms: dict[str, float] = {}
+
+                    def _probe_mark_dispatched(stage: str) -> None:
+                        if not _probe_is_enabled():
+                            return
+                        _probe_dispatched_ms[stage] = _probe_ns_to_ms(_probe_now_ns() - _probe_step_start_ns)
+
+                    def _probe_emit_stage(stage: str, wait_s: float) -> None:
+                        if not _probe_is_enabled():
+                            return
+                        _probe_emit_event(
+                            "critical_path_stage",
+                            stage=stage,
+                            step=self.global_steps,
+                            dispatched_at_ms=_probe_dispatched_ms.get(stage, 0.0),
+                            joined_at_ms=_probe_ns_to_ms(_probe_now_ns() - _probe_step_start_ns),
+                            wait_ms=float(wait_s) * 1000.0,
+                        )
+
+                    reward_future = None
+                    if self.use_rm and "rm_scores" not in batch.batch.keys():
+                        reward_future = self._compute_reward_colocate_async(batch)
+                        _probe_mark_dispatched("reward")
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1497,6 +1540,7 @@ class RayPPOTrainer:
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
                     else:  # Recompute old_log_probs
+                        _probe_mark_dispatched("old_log_prob")
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
@@ -1528,20 +1572,42 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+                        _probe_emit_stage("old_log_prob", timing_raw.get("old_log_prob", 0.0))
+
+                    # Join reward: its remote compute has been running in parallel with
+                    # old_log_prob above. `wait_ms` here reflects only leftover tail time.
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        if reward_future is not None:
+                            batch = batch.union(reward_future.get())
+                        # extract reward_tensor and reward_extra_infos_dict for training
+                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                    if reward_future is not None:
+                        _probe_emit_stage("reward", timing_raw.get("reward", 0.0))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            ref_log_prob = self._compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                    # Dispatch ref and critic forward passes concurrently.
+                    # Both worker-group calls return immediately (blocking=False) so
+                    # their GPU kernels run in parallel while the driver proceeds.
+                    _ref_future = self._compute_ref_log_prob(batch) if self.use_reference_policy else None
+                    if _ref_future is not None:
+                        _probe_mark_dispatched(str(Role.RefPolicy))
+                    _values_future = self._compute_values(batch) if self.use_critic else None
+                    if _values_future is not None:
+                        _probe_mark_dispatched("values")
 
-                    # compute values
-                    if self.use_critic:
+                    # Single barrier: materialize each future exactly when needed.
+                    # DataProto.union() transparently calls .get() on DataProtoFuture
+                    # arguments, so the timer records only the actual wait time.
+                    if _ref_future is not None:
+                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            batch = batch.union(_ref_future)
+                        _probe_emit_stage(str(Role.RefPolicy), timing_raw.get(str(Role.RefPolicy), 0.0))
+
+                    if _values_future is not None:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self._compute_values(batch)
-                            batch = batch.union(values)
+                            batch = batch.union(_values_future)
+                        _probe_emit_stage("values", timing_raw.get("values", 0.0))
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm

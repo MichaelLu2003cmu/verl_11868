@@ -1,3 +1,5 @@
+# verl/protocol.py
+
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,6 +49,145 @@ with contextlib.suppress(Exception):
     if parse_version(tensordict.__version__) < parse_version("0.10.0"):
         tensordict.set_list_to_stack(True).set()
 
+@dataclass
+class BatchInterval:
+    start: int
+    end: int  # exclusive
+
+    def overlap(self, other: "BatchInterval") -> Optional["BatchInterval"]:
+        s = max(self.start, other.start)
+        e = min(self.end, other.end)
+        if s >= e:
+            return None
+        return BatchInterval(s, e)
+
+@dataclass
+class PartitionSpec:
+    total_len: int
+    parts: int
+    pad_size: int = 0
+
+    @property
+    def padded_len(self) -> int:
+        return self.total_len + self.pad_size
+
+    @property
+    def chunk_len(self) -> int:
+        assert self.padded_len % self.parts == 0
+        return self.padded_len // self.parts
+
+    def interval(self, idx: int) -> BatchInterval:
+        chunk = self.chunk_len
+        return BatchInterval(idx * chunk, (idx + 1) * chunk)
+
+    def real_interval(self, idx: int) -> BatchInterval:
+        iv = self.interval(idx)
+        return BatchInterval(iv.start, min(iv.end, self.total_len))
+
+@dataclass
+class DataProtoSelectiveView:
+    futures: list[ray.ObjectRef]
+    source_partition: PartitionSpec
+    target_interval: BatchInterval
+
+    def get(self):
+        probe_enabled = is_enabled()
+        t0 = now_ns() if probe_enabled else 0
+
+        needed = []
+        fetch_indices = []
+        for i in range(self.source_partition.parts):
+            src_iv = self.source_partition.interval(i)
+            if src_iv.overlap(self.target_interval) is not None:
+                needed.append(self.futures[i])
+                fetch_indices.append(i)
+
+        ray_get_t0 = now_ns() if probe_enabled else 0
+        parts = ray.get(needed)
+        ray_get_ms = ns_to_ms(now_ns() - ray_get_t0) if probe_enabled else 0.0
+
+        if len(parts) == 1:
+            merged = parts[0]
+            base_start = self.source_partition.interval(fetch_indices[0]).start
+        else:
+            concat_t0 = now_ns() if probe_enabled else 0
+            merged = DataProto.concat(parts)
+            concat_ms = ns_to_ms(now_ns() - concat_t0) if probe_enabled else 0.0
+            base_start = self.source_partition.interval(fetch_indices[0]).start
+
+        local_start = self.target_interval.start - base_start
+        local_end = self.target_interval.end - base_start
+        out = merged[local_start:local_end]
+
+        if probe_enabled:
+            emit_event(
+                "future_selective_get",
+                future_count=len(self.futures),
+                fetched_count=len(needed),
+                ray_get_ms=ray_get_ms,
+                total_ms=ns_to_ms(now_ns() - t0),
+                output_bytes=estimate_nbytes(out),
+            )
+        return out
+
+@dataclass
+class DataProtoSliceMeta:
+    total_len: int
+    dp_size: int
+    pad_size: int = 0
+
+    def local_range(self, dp_rank: int) -> tuple[int, int]:
+        padded = self.total_len + self.pad_size
+        assert padded % self.dp_size == 0
+        chunk = padded // self.dp_size
+        start = dp_rank * chunk
+        end = start + chunk
+        real_end = min(end, self.total_len)
+        return start, real_end
+
+@dataclass
+class DataProtoPullHandle:
+    shard_refs: list[ray.ObjectRef]
+    meta: DataProtoSliceMeta
+    compress_meta: dict = field(default_factory=dict)  # key → {mode, orig_dtype, [scale]}
+
+    def materialize(self, dp_rank: int) -> "DataProto":
+        shard: "DataProto" = ray.get(self.shard_refs[dp_rank])
+        if self.compress_meta:
+            from tensordict import TensorDict
+            from verl.utils.transfer_compress import decompress_batch
+            decompressed = decompress_batch(dict(shard.batch), self.compress_meta)
+            shard.batch = TensorDict(source=decompressed, batch_size=shard.batch.batch_size)
+        return shard
+
+def build_selective_views_from_future(
+    future: "DataProtoFuture",
+    target_parts: int,
+) -> list["DataProtoSelectiveView"]:
+    # assume source futures correspond to equal contiguous partitions
+    source_parts = len(future.futures)
+    source_spec = PartitionSpec(
+        total_len=future.meta["total_len"],
+        parts=source_parts,
+        pad_size=future.meta.get("pad_size", 0),
+    )
+
+    target_spec = PartitionSpec(
+        total_len=future.meta["total_len"],
+        parts=target_parts,
+        pad_size=future.meta.get("pad_size", 0),
+    )
+
+    views = []
+    for target_idx in range(target_parts):
+        views.append(
+            DataProtoSelectiveView(
+                futures=future.futures,
+                source_partition=source_spec,
+                target_interval=target_spec.real_interval(target_idx),
+            )
+        )
+    return views
 
 class _DataProtoConfigMeta(type):
     _config = {}
@@ -787,11 +928,16 @@ class DataProto:
         - there are conflict keys in meta_info and they are not the same.
 
         Args:
-            other (DataProto): another DataProto to union
+            other (DataProto | DataProtoFuture): another DataProto to union.
+                If a DataProtoFuture is passed it is materialized first via
+                .get(), allowing callers to fire non-blocking worker-group
+                calls and pass the returned future directly here.
 
         Returns:
             DataProto: the DataProto after union
         """
+        if isinstance(other, DataProtoFuture):
+            other = other.get()
         self.batch = union_tensor_dict(self.batch, other.batch)
         self.non_tensor_batch = union_numpy_dict(self.non_tensor_batch, other.non_tensor_batch)
         self.meta_info = union_two_dict(self.meta_info, other.meta_info)

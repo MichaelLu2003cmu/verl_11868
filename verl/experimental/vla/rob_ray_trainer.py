@@ -367,20 +367,27 @@ class RobRayPPOTrainer(RayPPOTrainer):
 
                             metrics.update(calculate_debug_metrics(batch))
 
+                    # Dispatch ref and critic forward passes concurrently.
+                    # Both calls return DataProtoFuture (blocking=False) so their
+                    # GPU kernels run in parallel while the driver proceeds.
                     if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer("ref", timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                        if not self.ref_in_actor:
+                            _ref_future = self.ref_policy_wg.compute_ref_log_prob(batch)
+                        else:
+                            _ref_future = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                    else:
+                        _ref_future = None
 
-                    # compute values
-                    if self.use_critic:
+                    _values_future = self.critic_wg.compute_values(batch) if self.use_critic else None
+
+                    # Single barrier: DataProto.union() materializes futures transparently.
+                    if _ref_future is not None:
+                        with marked_timer("ref", timing_raw, color="olive"):
+                            batch = batch.union(_ref_future)
+
+                    if _values_future is not None:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                            batch = batch.union(_values_future)
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
