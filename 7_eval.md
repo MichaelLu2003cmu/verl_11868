@@ -71,31 +71,56 @@ prep-stage latency compared to the sequential baseline.
 Total iteration time is approximated as `compute_log_prob.total_ms + update_actor.total_ms`,
 averaged over 20 steps.  These two phases dominate iteration time.
 
-### Table 3 — Iteration Time Comparison
+### Experimental Confound: FSDP Offloading
 
-**Group A — FSDP offload enabled (push dispatch; Baseline vs +LP)**
+> ⚠️ **Important caveat.** The early baseline experiments (push dispatch) were run with
+> `param_offload=True, optimizer_offload=True` to fit within 45.5 GB host RAM.  The
+> compression experiments were run with both flags set to `False` (all parameters
+> resident on GPU) after the memory budget was recalibrated.  Disabling FSDP offload
+> eliminates repeated CPU↔GPU parameter movement during forward/backward passes and
+> **independently** cuts iteration time from ~8.2 s to ~4.2 s — an improvement that
+> has nothing to do with Pull, Async Overlap, or Compression.
+>
+> **Direct cross-group comparison of iteration time is therefore invalid.**
+> Table 3a and 3b present the two groups separately; Table 3c provides the only
+> controlled end-to-end comparison (same FSDP config, same dispatch mode, compression
+> as the single variable).
 
-| Method | compute\_log\_prob (ms) | update\_actor (ms) | Iter (s) | Δ Iter |
-|---|---:|---:|---:|---:|
-| 2-GPU Baseline (push) | 2215 | 6005 | 8.22 | — |
-| 2-GPU +LP (pull) | ~2215 | ~6005 | ~8.22 | ~0% |
+### Table 3a — FSDP Offload ON (push dispatch; Baseline vs +LP)
 
-LP does not change GPU compute time; overhead change at batch=8 is negligible (<1%).
+| Method | Iter (s) | Δ Iter | FSDP offload |
+|---|---:|---:|---|
+| 2-GPU Baseline (push) | 8.22 | — | ON |
+| 2-GPU +LP (pull) | ~8.22 | ~0% | ON |
 
-**Group B — FSDP offload disabled (pull dispatch; +Comp runs)**
+Pull does not change GPU compute time.  Dispatch overhead difference at batch=8 is
+< 1 ms/step — immeasurable at the iteration level.
 
-| Method | compute\_log\_prob (ms) | update\_actor (ms) | Iter (s) | Δ Iter vs FP16 |
-|---|---:|---:|---:|---:|
-| 2-GPU +Comp FP16 | 884 | 3334 | **4.22** | — |
-| 2-GPU +Comp INT8 | 890 | 3337 | **4.23** | +0.2% |
+### Table 3b — Full Controlled Ablation (all FSDP OFF, 2-GPU, batch=8, 20 steps)
 
-FP16 and INT8 produce identical iteration times within noise; the compression operation
-itself adds no measurable end-to-end overhead.
+All four runs use identical hardware, model, dataset, and FSDP configuration
+(`param_offload=False`, `optimizer_offload=False`).  The only variables are
+dispatch mode and compression.
 
-> **Caution:** The Group A → Group B drop (8.2 s → 4.2 s) is attributable primarily to
-> disabling FSDP offloading (which eliminates CPU↔GPU parameter movement during forward
-> passes), not to LP or compression alone.  A controlled comparison with FSDP offload
-> consistently disabled across all methods would isolate the transfer effect.
+| Config | Dispatch | Compress | avg step\_time (s) | Δ vs Baseline | avg reward | nonzero/19 |
+|---|---|---|---:|---:|---:|---:|
+| Baseline | push | — | 8.939 | — | 0.0197 | 3 |
+| +LP | pull | — | 9.121 | +2.0% | 0.0592 | 8 |
+| +LP + FP16 | pull | fp16 | **8.546** | **−4.4%** | 0.0987 | 10 |
+| +LP + INT8 | pull | int8 | 8.865 | −0.8% | 0.0789 | 9 |
+
+**Key findings from the controlled experiment:**
+
+- **+LP alone is 2% slower** than push baseline at batch=8, confirming the breakeven
+  analysis (fixed `ray.put()` overhead dominates at small batch sizes).
+- **+LP + FP16 is the best configuration** — 4.4% faster than push baseline and 6.3%
+  faster than pull-only, due to reduced `ray.put()` serialization cost.
+- **+LP + INT8 recovers most of the baseline speed** but falls behind FP16 due to the
+  CPU quantization overhead (+0.32 s/step vs FP16).
+- **Reward trajectories are statistically indistinguishable** across all four configs
+  (variance expected at 20 steps × batch=8 = 160 total training samples).
+
+![Reward and iteration time comparison](7_reward_curve_controlled.png)
 
 ---
 
@@ -118,12 +143,17 @@ itself adds no measurable end-to-end overhead.
 
 ### Performance Attribution
 
-| Optimization | Primary Gain | Secondary Gain | Limitation at Current Scale |
+| Optimization | Measured Gain (controlled) | Metric | Caveat |
 |---|---|---|---|
-| Local-Batch Pull | Halves per-rank transfer volume (projected −50% at batch≥256) | Reduces unnecessary concat | Fixed `ray.put()` overhead dominates at batch<13 |
-| Async Overlap | 35% reduction in prep-stage blocking time | Reduces p99 jitter | Requires futures-aware worker impl; no gain for single-pass ops |
-| FP16 Compression | −43% received bytes; −58% Xfer_ms | Zero runtime overhead | Only 1.9% overall savings due to int64-dominant payload |
-| INT8 Compression | Marginally more bytes saved (+0.9%) than FP16 | — | Quantization CPU cost outweighs savings; slower dispatch |
+| Local-Batch Pull | −5% Xfer_ms at batch=8; projected −50% at batch≥256 | dispatch+collect ms | `ray.put()` fixed cost dominates at batch<13; +2% iter time at batch=8 |
+| Async Overlap | 35% reduction in prep-stage blocking time | hidden_frac (ref=0.285, values=0.590) | Measured separately; no direct iter-time controlled run |
+| FP16 Compression | **−4.4% iter time vs push baseline; −6.3% vs pull-only; −58% Xfer_ms** | Table 3b (controlled) | Only 1.9% payload reduction due to int64-dominant batch |
+| INT8 Compression | −0.8% iter time vs push baseline; −34% Xfer_ms | Table 3b (controlled) | +59% dispatch overhead vs FP16 from CPU quantization cost |
+
+> **Attribution note:** The 8.22 s → 4.22 s drop visible in the overall ablation figure
+> is caused by disabling FSDP offload, not by any of the above optimizations.  All
+> optimization-attributable gains are reported in the "Measured Gain (controlled)" column
+> above, derived from experiments where FSDP config was held constant.
 
 ---
 

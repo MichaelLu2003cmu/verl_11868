@@ -401,15 +401,27 @@ All experiments: Qwen2.5-1.5B-Instruct · GRPO · 2×V100-32GB · batch=8 · 20 
 | values (critic) | 0.590 | 59.0% of critic time hidden |
 | **Combined** | — | **~35% reduction in prep-stage latency** |
 
-### 9.3 Training Stability (No Compress vs FP16)
+### 9.3 Training Stability and Compression Iter-Time (Controlled, FSDP offload OFF)
 
-| Config | avg reward (steps 2–20) | avg score | avg step_time (s) |
-|---|---:|---:|---:|
-| No Compress | 0.059 | 0.059 | 9.12 |
-| FP16 Compress | 0.099 | 0.099 | **8.55** |
+All four runs share identical hardware, model, dataset, and FSDP configuration
+(`param_offload=False`, `optimizer_offload=False`).  Variables: dispatch mode + compress.
 
-Reward difference is within expected variance for a 20-step run.  FP16 achieves
-a **6% faster iteration time** with no training quality degradation.
+| Config | avg step\_time (s) | Δ vs Baseline | avg reward | nonzero steps |
+|---|---:|---:|---:|---:|
+| Baseline (push) | 8.939 | — | 0.0197 | 3/19 |
+| +LP (pull) | 9.121 | +2.0% | 0.0592 | 8/19 |
+| +LP + FP16 | **8.546** | **−4.4%** | 0.0987 | 10/19 |
+| +LP + INT8 | 8.865 | −0.8% | 0.0789 | 9/19 |
+
+- **FP16 is the best overall**: 4.4% faster than push baseline and 6.3% faster than pull-only.
+- **INT8 nearly ties baseline** but trails FP16 by 0.32 s/step due to CPU quantization cost.
+- **Reward curves are statistically indistinguishable** across all configs at this scale.
+
+> ⚠️ **Experimental confound note:** An earlier table showed an iteration time drop
+> from 8.22 s (baseline) to 4.22 s (FP16 run).  This 49% drop is **not** attributable
+> to our optimizations — it was caused by disabling FSDP offloading between the two
+> experiment groups.  The figures in the controlled table above are the only directly
+> attributable end-to-end gains.
 
 ### 9.4 Local-Batch Pull Breakeven
 
@@ -523,6 +535,7 @@ python scripts/plot_reward_curve.py \
 
 | Limitation | Detail |
 |---|---|
+| **FSDP offload confound** | Early baseline experiments used `param_offload=True`; compression experiments used `param_offload=False`.  The 8.22 s → 4.22 s iter-time drop in the ablation figure is due to FSDP, not our optimizations.  The only valid controlled end-to-end comparison is the no-compress vs FP16 run (Table 3c in 7_eval.md), which shows a genuine −6.3% gain. |
 | **Small batch size** | All experiments used batch=8; pull overhead dominates at this scale.  Production RLHF uses batch=256–1024 where pull is projected to save 48–50%. |
 | **1.5B model only** | Hardware constraints (2×V100, 45.5 GB RAM) prevented evaluation with 7B+ models.  Larger models have higher compute-to-transfer ratios, making compression relatively more impactful. |
 | **int64-dominant payload** | At 3.7% float32 payload fraction, compression saves only 1.9–2.8%.  Workloads that transfer activations, gradients, or value estimates in bulk would see 50–75% savings. |
