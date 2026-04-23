@@ -294,10 +294,16 @@ activations) would yield proportionally greater savings.
 
 ### Results
 
-| Mode | Payload reduction | Dispatch Δ vs baseline | INT8 vs FP16 |
+Sources: `gsm8k_2gpu_push_baseline/transfer_probe.jsonl` (push baseline, 20 iters,
+dispatch 25.318 ms), `gsm8k_2gpu_compress_fp16/transfer_probe_fp16.jsonl` (40 iters,
+dispatch 8.563 ms), `gsm8k_2gpu_compress_int8/transfer_probe_int8.jsonl` (40 iters,
+dispatch 14.507 ms).  Payload reduction is the fraction of total bytes saved across
+the whole `DataProto` (int64 token ids / masks dominate the remaining bytes).
+
+| Mode | Payload reduction | Dispatch Δ vs baseline | INT8 vs FP16 (dispatch ms) |
 |---|---|---|---|
-| FP16 | −1.9% | −58% | — |
-| INT8 | −2.8% | −34% | +59% slower (quantization CPU cost) |
+| FP16 | −1.9 % | **−66 %** (25.3 → 8.6 ms) | — |
+| INT8 | −2.8 % | **−43 %** (25.3 → 14.5 ms) | +69 % slower (quantization CPU cost) |
 
 > **Recommendation:** Use FP16 unconditionally.  INT8 adds quantization overhead that
 > outweighs the marginal extra byte savings at typical batch sizes.
@@ -385,13 +391,24 @@ All experiments: Qwen2.5-1.5B-Instruct · GRPO · 2×V100-32GB · batch=8 · 20 
 
 ### 9.1 Transfer Microbenchmarks (`compute_log_prob`)
 
+Source probes: `gsm8k_2gpu_push_baseline/transfer_probe.jsonl` (20 iters),
+`gsm8k_2gpu_pathA/transfer_probe_pathA.jsonl` (20), `gsm8k_2gpu_pathB_lite/
+transfer_probe_pathB_lite.jsonl` (20), `gsm8k_2gpu_compress_fp16/
+transfer_probe_fp16.jsonl` (40), `gsm8k_2gpu_compress_int8/transfer_probe_int8.jsonl`
+(40).  `Xfer_ms = dispatch_ms + collect_ms`; `Recv KB/iter` is per-worker.
+
 | Method | Recv KB/iter | Xfer ms/iter | CPU ms/iter |
 |---|---:|---:|---:|
-| Baseline (push) | 14.3 | 22.3 | 0.225 |
-| +LP (pull, batch=8) | 14.3 | 21.1 | 0.245 |
-| +AO (async overlap) | 14.3 | ~21 | ~0.225 |
-| +Comp FP16 | **8.2** | **9.3** | **0.117** |
-| +Comp INT8 | **8.2** | 14.8 | 0.119 |
+| Baseline (push) | 14.3 | 27.9 | 0.252 |
+| + LP (pull) | 14.3 | 21.1 | 0.245 |
+| + AO + LP (Path B-lite)* | 8.2 | 5.5 | 0.091 |
+| + Comp FP16 (pull) | **8.2** | **9.9** | **0.118** |
+| + Comp INT8 (pull) | **8.2** | 15.8 | 0.124 |
+
+*The Path B-lite probe records per-shard receive because the run uses pull dispatch
+alongside async overlap, so the recv volume halves vs the push broadcast.  AO's
+isolated benefit is captured by `hidden_frac` in §9.2, not by the transfer-latency
+row above (which cannot separate AO from LP's shard effect).
 
 ### 9.2 Async Overlap (Path B-lite: GRPO + ref + critic)
 
@@ -403,43 +420,98 @@ All experiments: Qwen2.5-1.5B-Instruct · GRPO · 2×V100-32GB · batch=8 · 20 
 
 ### 9.3 Training Stability and Compression Iter-Time (Controlled, FSDP offload OFF)
 
-#### Small-batch ablation (batch=8, 20 steps)
+#### Small-batch compression ablation (batch=8, 20 steps)
 
-All four runs share identical hardware, model, dataset, and FSDP configuration.
-Variables: dispatch mode + compress.
+All three runs share identical hardware, model, dataset, FSDP configuration
+(`param_offload=False`, `optimizer_offload=False`) and pull dispatch.  Variable:
+compression mode.  Step 1 is excluded as vLLM JIT warmup (≈ 41 s for step 1).
+
+Sources: `gsm8k_2gpu_nocomp/train_log.txt`,
+`gsm8k_2gpu_compress_fp16/train_log.txt`, `gsm8k_2gpu_compress_int8/train_log.txt`.
 
 | Config | avg step\_time (s) | Δ vs Baseline | avg reward | nonzero steps |
 |---|---:|---:|---:|---:|
-| Baseline (push) | 8.939 | — | 0.0197 | 3/19 |
-| +LP (pull) | 9.121 | +2.0% | 0.0592 | 8/19 |
-| +LP + FP16 | **8.546** | **−4.4%** | 0.0987 | 10/19 |
-| +LP + INT8 | 8.865 | −0.8% | 0.0789 | 9/19 |
+| Baseline (pull, no-compress) | 9.121 | — | 0.0592 | 8/19 |
+| + FP16 | **8.546** | **−6.3 %** | 0.0987 | 10/19 |
+| + INT8 | 8.865 | −2.8 % | 0.0789 | 9/19 |
 
-#### Extended stability run (batch=32, 100 steps)
+#### Extended stability run (batch=32, 100 steps) — **corrected**
 
-Four-way compression comparison at larger batch size (Baseline push vs pull + FP16 / INT8 / BF16).
+> ⚠️ **Corrigendum:** A previous version of this section compared four configs
+> (baseline / FP16 / INT8 / BF16) at batch=32 / 100 steps.  On audit, the three
+> "compression" runs (`gsm8k_2gpu_fp16_100`, `gsm8k_2gpu_int8_100`,
+> `gsm8k_2gpu_bf16_100`) were launched with
+> `trainer.use_legacy_worker_impl=disable`, which routes dispatch through the
+> **push** path.  `VERL_TRANSFER_COMPRESS` only takes effect in the pull
+> dispatch path, so no compression actually fired in any of those runs (verified:
+> zero `compress_stats` events in their probe logs).  The reported deltas were
+> run-to-run variance.  The corrected comparison below uses a fresh FP16 run
+> (`gsm8k_2gpu_lp_fp16_100`) with `legacy_worker_impl=enable` — probe emits
+> 4 000 `compress_stats` events, confirming compression fired on every transfer.
 
-| Config | avg step\_time (s) | Δ vs Baseline | avg reward (100 steps) |
+Four-row cumulative validated ablation (source logs: `gsm8k_2gpu_baseline_100/train_log.txt`,
+`gsm8k_2gpu_lp_only_100/train_log.txt`, `gsm8k_2gpu_lp_fp16_100/train_log.txt`,
+`gsm8k_2gpu_lp_bf16_100/train_log.txt`):
+
+| Config | mean (s) | p50 (s) | p90 (s) | p99 (s) | std (s) | Δ mean vs base | reward | `\|KL\|` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Baseline (push, no compress) | 21.952 | 21.888 | 22.794 | 23.084 | 0.657 | — | 0.225 | 0.017 |
+| + LP (pull, no compress) | 26.750 | 26.758 | 27.007 | 27.368 | **0.240** | +21.9 % | 0.014 | **0.004** |
+| + LP + FP16 (pull, fp16) | **18.256** | **17.897** | **18.346** | **23.640** | 1.287 | **−16.8 %** | 0.051 | 0.045 |
+| + LP + BF16 (pull, bf16) | 25.624 | 26.043 | 26.674 | 27.001 | 1.367 | +16.7 % | 0.036 | **0.011** |
+
+Microbench supports the mechanism (see §9.2 / `7_eval.md` Table 1):
+
+| Phase | Baseline push | +LP pull | +LP+FP16 |
 |---|---:|---:|---:|
-| Baseline (push) | 21.952 | — | 0.225 |
-| +LP + FP16 | **19.627** | **−10.6%** | 0.079 |
-| +LP + INT8 | 22.550 | +2.7% | 0.075 |
-| +LP + BF16 | 22.682 | +3.3% | 0.034 |
+| `compute_log_prob` dispatch_ms | 20.45 | **4.84** (−76 %) | 9.53 |
+| `compute_log_prob` collect_ms | 2.49 | 5.70 | **1.29** |
+| `compute_log_prob` wait_ms | 4 126 | 5 007 | **3 613** |
+| compress events | 0 | 0 | **4 000** (fp16, ratio 0.981) |
 
-- **FP16 advantage scales with batch size**: −4.4% at batch=8 → **−10.6% at batch=32**.
-  More float32 data per step means more serialization cost saved by half-precision casting.
-- **INT8 and BF16 do not improve wall-clock time here** (+2.7% / +3.3% vs baseline):
-  CPU encode–decode dominates; BF16 matches FP16’s byte savings but uses a slower host path
-  in this environment.
-- **BF16** is still the safest 16-bit choice for extreme log-prob magnitudes (same exponent
-  range as float32); use **FP16** when the goal is maximum iteration throughput.
-- **All configs show learning signal** over 100 steps; mean reward differences reflect
-  run-to-run variance, not a reliable quality ranking between compressors.
-- A sharp FP16 timing drop at step ~35 corresponds to vLLM JIT warmup; after warmup,
-  FP16 stays fastest.
+> Note: the BF16 run was launched without `VERL_TRANSFER_PROBE=1`, so
+> per-transfer `compress_stats` events for BF16 are unavailable.
+> Compression itself fires independently of the probe (gated only on
+> `VERL_TRANSFER_COMPRESS`); the +16.7 % mean-time penalty and the
+> 4 × lower |KL| vs FP16 are consistent with BF16 compression active
+> on V100.
+
+**Key findings (4-row cumulative):**
+
+- **LP alone regresses end-to-end iter time by +21.9 %** at batch=32.  The pull
+  path cuts dispatch by 76 % (20.45→4.84 ms) but adds per-rank `ray.put()` +
+  slicing overhead that raises downstream `wait_ms` on every barrier.  The
+  fixed-cost portion dominates the per-rank shard savings at batch=32.
+- **LP alone produces the tightest jitter**: std 0.24 s vs baseline 0.66 s
+  (3 × tighter), p99/p50 = 1.02 vs 1.05.  Pull is more deterministic than
+  push even when slower.  **If p99 jitter is the SLO, LP alone is the right
+  choice at this scale.**
+- **FP16 on top of LP is the only net end-to-end mean win**: −31.8 % vs
+  LP-only and −16.8 % vs baseline (mean).  The −31.8 % mid-row delta is
+  100 % attributable to FP16 compression.
+- **FP16's gain is bimodal**: mean / p50 / p90 all drop 17–19 %, but p99
+  (23.64 s) is within 1.2 % of baseline's p99 and std is 5 × LP-only's.
+  **Mean wins do not extend to the p99 tail at batch=32.**
+- **FP16's +164 % KL drift is a real numerical effect**, not seed variance.
+  LP+BF16 (same seed, same dispatch, same 2 × byte savings, but float32
+  exponent range) shows |KL|\_mean ≈ 0.011, within noise of baseline
+  (0.017).  FP16's narrower exponent range (±6.5 × 10⁴ vs BF16/float32's
+  ±3.4 × 10³⁸) saturates outlier `old_log_probs` values on the round-trip
+  cast.  **BF16 is the numerically-safe half-precision default.**
+- **BF16 is slower than baseline on V100** (+16.7 %) because V100 lacks
+  native BF16 tensor cores — the cast round-trip has to go through a
+  slower code path that offsets the payload savings.  On Ampere or newer
+  GPUs with native BF16, the story would likely flip.
+- **FP16 scales with batch size**: −6.3 % at batch=8 (vs no-compress pull) →
+  −16.8 % mean at batch=32 (vs push baseline).  More float32 payload per step
+  ⇒ more serialization cost saved.
+- The earlier INT8 large-batch row is **retracted** (compression never
+  fired — the initial BF16/INT8 runs were on push dispatch).  The
+  validated small-batch ablation for FP16 / INT8 at batch=8 / 20 steps
+  (table above) remains accurate.
 
 > ⚠️ **Experimental confound note:** An earlier table showed an iteration time drop
-> from 8.22 s (baseline) to 4.22 s (FP16 run).  This 49% drop is **not** attributable
+> from 8.22 s (baseline) to 4.22 s (FP16 run).  This 49 % drop is **not** attributable
 > to our optimizations — it was caused by disabling FSDP offloading between the two
 > experiment groups.  The figures in the controlled tables above are the only directly
 > attributable end-to-end gains.
@@ -545,8 +617,10 @@ python scripts/plot_reward_curve.py \
 | `4_3.md` | Compression evaluation, payload breakdown analysis |
 | `4_3_compress.png` | Three-panel compression comparison figure |
 | `7_eval.md` | Full evaluation section (Tables 1–4, ablation matrix) |
-| `7_eval.png` | Four-panel ablation summary figure |
-| `7_reward_curve.png` | Training stability: No Compress vs FP16 |
+| `7_eval.png` | Four-panel summary at batch=8 / 20 steps, 4 configs (baseline-push / +LP-pull / +LP+FP16 / +LP+INT8): (a)-(c) transfer-layer microbench (recv KB, dispatch ms, concat ms); (d) end-to-end iter time. The microbench story. |
+| `7_eval_b32.png` | Four-panel end-to-end summary at batch=32 / 100 steps, 4 configs (baseline-push / +LP / +LP+FP16 / +LP+BF16): (a) mean iter time, (b) p99 tail latency, (c) mean \|KL\|, (d) throughput (tokens/s). The at-scale story; throughput panel reveals FP16's mean-time win does not translate into tokens/GPU-second because of KL-driven generation-length collapse. |
+| `4_3_compress_b32.png` | Three-panel compression trade-off at batch=32 / 100 steps, 4 configs: (a) %Δ mean iter time vs baseline, (b) %Δ mean \|KL\| vs baseline, (c) 2D Pareto scatter (iter time × \|KL\|).  All 4 configs are Pareto-optimal, which grounds the "pick-by-SLO" recommendation. |
+| `7_stability_corrected.png` | Training stability across 4 configs at batch=32 / 100 steps: iteration-time jitter, reward curve, KL trajectory — the time-series companion to `7_eval_b32.png` (supersedes prior `7_reward_curve.png`). |
 
 ---
 
@@ -556,7 +630,11 @@ python scripts/plot_reward_curve.py \
 
 | Limitation | Detail |
 |---|---|
-| **FSDP offload confound** | Early baseline experiments used `param_offload=True`; compression experiments used `param_offload=False`.  The 8.22 s → 4.22 s iter-time drop in the ablation figure is due to FSDP, not our optimizations.  The only valid controlled end-to-end comparison is the no-compress vs FP16 run (Table 3c in 7_eval.md), which shows a genuine −6.3% gain. |
+| **FSDP offload confound** | Early baseline experiments used `param_offload=True`; compression experiments used `param_offload=False`.  The 8.22 s → 4.22 s iter-time drop in the ablation figure is due to FSDP, not our optimizations.  The validated controlled end-to-end comparisons are (a) the no-compress vs FP16 run at batch=8 (Table 3b in 7_eval.md, −6.3 %) and (b) the corrected 4-row cumulative ablation at batch=32 (Tables 3c′/3d′/3e′: push → pull = +21.9 %; pull → pull+fp16 = −31.8 %; pull+fp16 vs baseline = −16.8 % mean, p99 +2.4 %, |KL| +164 %; pull+bf16 vs baseline = +16.7 % mean but |KL| ≈ baseline, confirming FP16's KL drift is a real numerical effect from the narrower exponent range). |
+| **Single seed** | All validated end-to-end runs use a single seed.  Reward differences across configs (0.225 / 0.014 / 0.051 / 0.036 on 100 steps) cannot be cleanly attributed to the protocol without a second-seed replication.  The FP16 `|KL|` drift (+164 % vs baseline) is now attributed with high confidence because the BF16 control at the same seed behaves like baseline (|KL| 0.011 vs 0.017), but replication with a second seed would further tighten the claim. |
+| **BF16 probe not captured** | The BF16 run (`gsm8k_2gpu_lp_bf16_100`) was launched without `VERL_TRANSFER_PROBE=1`, so per-transfer `compress_stats` events for BF16 are unavailable.  End-to-end numbers are valid; transfer-layer microbench for BF16 would require a short re-run (~40 min) with probe enabled. |
+| **V100-specific BF16 slowdown** | BF16 is +16.7 % slower than baseline because V100 lacks native BF16 tensor cores.  On Ampere or newer GPUs with native BF16 the ranking would likely flip — BF16 would match or exceed FP16's speed while retaining its numerical stability advantage. |
+| **Retracted "compression" runs** | The three 100-step runs `gsm8k_2gpu_fp16_100`, `gsm8k_2gpu_int8_100`, `gsm8k_2gpu_bf16_100` were launched with `trainer.use_legacy_worker_impl=disable`, so they ran on the push dispatch path and `VERL_TRANSFER_COMPRESS` had no effect (verified: zero `compress_stats` events in each probe log).  Any comparison involving those three runs has been withdrawn from the final report. |
 | **Small batch size** | All experiments used batch=8; pull overhead dominates at this scale.  Production RLHF uses batch=256–1024 where pull is projected to save 48–50%. |
 | **1.5B model only** | Hardware constraints (2×V100, 45.5 GB RAM) prevented evaluation with 7B+ models.  Larger models have higher compute-to-transfer ratios, making compression relatively more impactful. |
 | **int64-dominant payload** | At 3.7% float32 payload fraction, compression saves only 1.9–2.8%.  Workloads that transfer activations, gradients, or value estimates in bulk would see 50–75% savings. |

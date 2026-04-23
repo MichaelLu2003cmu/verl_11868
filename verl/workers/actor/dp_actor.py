@@ -601,10 +601,20 @@ class DataParallelPPOActor(BasePPOActor):
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
                     else:
-                        if on_policy:
-                            old_log_prob = log_prob.detach()
-                        else:
-                            old_log_prob = model_inputs["old_log_probs"]
+                        # Stability fix (7_stability_corrected.png):  always use the
+                        # pre-computed old_log_probs from the frozen snapshot, even
+                        # when on_policy=True (ppo_epochs==1 and one mini-batch).
+                        # The former `log_prob.detach()` shortcut made ratio==1 exactly
+                        # and bypassed PPO clipping, which let a single large-advantage
+                        # step (observed at step 12-19 of gsm8k_2gpu_lp_only_100) push
+                        # the policy out of the "#### <answer>" output format.  Once
+                        # the format breaks, all rewards in a GRPO group are 0,
+                        # advantage-std normalization yields 0 advantages, and the
+                        # gradient is permanently 0 (steps 22-100).  Using the stored
+                        # old_log_probs is mathematically equivalent on the first
+                        # micro-batch (identical weights) but keeps PPO clipping
+                        # active so a runaway gradient is bounded.
+                        old_log_prob = model_inputs["old_log_probs"]
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla

@@ -108,20 +108,31 @@ def summarize(log_path: Path) -> None:
 
     print("## Transfer Latency Baseline")
     print(
-        "| method_name | iters | dispatch_ms/iter | wait_ms/iter | collect_ms/iter | total_ms/iter | send_MB/iter | recv_MB/iter |"
+        "| method_name | iters | dispatch_ms/iter | wait_ms/iter | collect_ms/iter | total_ms/iter | send_MB/iter | recv_MB/iter | eff_MB_per_s (recv/xfer) |"
     )
-    print("|---|---:|---:|---:|---:|---:|---:|---:|")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
     for name, s in sorted(transfer_stats.items(), key=lambda kv: kv[0]):
         n = s["count"]
+        dispatch = _safe_div(s["dispatch_ms"], n)
+        collect = _safe_div(s["collect_ms"], n)
+        xfer_ms = dispatch + collect
+        recv_mb = _safe_div(s["recv_bytes"], n) / (1024**2)
+        # MB/s = (recv MB) / (xfer seconds); xfer_ms -> /1000.  Equivalent to recv_MB*1000/xfer_ms.
+        eff_mbps = _safe_div(recv_mb * 1000.0, xfer_ms)
         print(
             f"| {name} | {n} | "
-            f"{_safe_div(s['dispatch_ms'], n):.3f} | "
+            f"{dispatch:.3f} | "
             f"{_safe_div(s['wait_ms'], n):.3f} | "
-            f"{_safe_div(s['collect_ms'], n):.3f} | "
+            f"{collect:.3f} | "
             f"{_safe_div(s['total_ms'], n):.3f} | "
             f"{_safe_div(s['send_bytes'], n) / (1024**2):.3f} | "
-            f"{_safe_div(s['recv_bytes'], n) / (1024**2):.3f} |"
+            f"{recv_mb:.3f} | "
+            f"{eff_mbps:.2f} |"
         )
+    print(
+        "\n_`eff_MB_per_s` = per-worker recv_MB / (dispatch_ms + collect_ms) × 1000; "
+        "higher is better.  This is the proposal §7.1 (iv) effective transfer throughput._"
+    )
 
     print("\n## CPU Overhead Baseline")
     print("| location | iters | elapsed_ms/iter | output_MB/iter |")

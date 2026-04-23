@@ -603,10 +603,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         fsdp_enable_zero3 = fsdp_config.reshard_after_forward
         sharding_strategy = get_sharding_strategy(fsdp_mesh, fsdp_enable_zero3)
 
-        # TODO: add transformer policy
-        # We force reference policy to use CPUOffload to save memory.
-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation.
+        # For non-actor roles (ref, rollout), honour fsdp_config.param_offload (default False).
+        # Forcing CPUOffload=True for ref with async rollout causes a CPU→GPU copy race that
+        # kills the worker at the first ref forward pass; set ref.fsdp_config.param_offload=False
+        # to keep ref params on GPU when GPU memory allows it.
+        if role == "actor":
+            cpu_offload = None
+        else:
+            cpu_offload = CPUOffload(offload_params=True) if fsdp_config.get("param_offload", False) else None
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(

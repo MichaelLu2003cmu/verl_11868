@@ -233,6 +233,8 @@ class FSDPEngineConfig(EngineConfig):
 
     # fsdp specific flags
     wrap_policy: dict[str, Any] = field(default_factory=dict)
+    param_offload: bool = False
+    optimizer_offload: bool = False
     offload_policy: bool = False
     reshard_after_forward: bool = True
     fsdp_size: int = -1
